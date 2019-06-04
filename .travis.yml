@@ -1,8 +1,9 @@
 sudo: required
-dist: trusty
+dist: xenial
 
 language:
     - c
+    - c++
 addons:
   apt:
     sources:
@@ -11,9 +12,12 @@ addons:
     - doxygen
     - valgrind
     - clang
+    - libstdc++-7-dev 
     - gcc
-    - gcc-6
+    - gcc-7
     - python3-pip
+    - python3-setuptools
+    - ninja-build
 install: test/travis-install.sh
 script: test/travis-build.sh
 

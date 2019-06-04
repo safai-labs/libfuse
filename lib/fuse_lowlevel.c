@@ -284,7 +284,7 @@ size_t fuse_add_direntry(fuse_req_t req, char *buf, size_t bufsize,
 	dirent->ino = stbuf->st_ino;
 	dirent->off = off;
 	dirent->namelen = namelen;
-	dirent->type = (stbuf->st_mode & 0170000) >> 12;
+	dirent->type = (stbuf->st_mode & S_IFMT) >> 12;
 	strncpy(dirent->name, name, namelen);
 	memset(dirent->name + namelen, 0, entlen_padded - entlen);
 
@@ -377,7 +377,7 @@ size_t fuse_add_direntry_plus(fuse_req_t req, char *buf, size_t bufsize,
 	dirent->ino = e->attr.st_ino;
 	dirent->off = off;
 	dirent->namelen = namelen;
-	dirent->type = (e->attr.st_mode & 0170000) >> 12;
+	dirent->type = (e->attr.st_mode & S_IFMT) >> 12;
 	strncpy(dirent->name, name, namelen);
 	memset(dirent->name + namelen, 0, entlen_padded - entlen);
 
@@ -392,6 +392,8 @@ static void fill_open(struct fuse_open_out *arg,
 		arg->open_flags |= FOPEN_DIRECT_IO;
 	if (f->keep_cache)
 		arg->open_flags |= FOPEN_KEEP_CACHE;
+	if (f->cache_readdir)
+		arg->open_flags |= FOPEN_CACHE_DIR;
 	if (f->nonseekable)
 		arg->open_flags |= FOPEN_NONSEEKABLE;
 }
@@ -1315,7 +1317,7 @@ static void do_write(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 
 	memset(&fi, 0, sizeof(fi));
 	fi.fh = arg->fh;
-	fi.writepage = (arg->write_flags & 1) != 0;
+	fi.writepage = (arg->write_flags & FUSE_WRITE_CACHE) != 0;
 
 	if (req->se->conn.proto_minor < 9) {
 		param = ((char *) arg) + FUSE_COMPAT_WRITE_IN_SIZE;
@@ -1345,7 +1347,7 @@ static void do_write_buf(fuse_req_t req, fuse_ino_t nodeid, const void *inarg,
 
 	memset(&fi, 0, sizeof(fi));
 	fi.fh = arg->fh;
-	fi.writepage = arg->write_flags & 1;
+	fi.writepage = arg->write_flags & FUSE_WRITE_CACHE;
 
 	if (se->conn.proto_minor < 9) {
 		bufv.buf[0].mem = ((char *) arg) + FUSE_COMPAT_WRITE_IN_SIZE;
@@ -1420,12 +1422,13 @@ static void do_fsync(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 {
 	struct fuse_fsync_in *arg = (struct fuse_fsync_in *) inarg;
 	struct fuse_file_info fi;
+	int datasync = arg->fsync_flags & 1;
 
 	memset(&fi, 0, sizeof(fi));
 	fi.fh = arg->fh;
 
 	if (req->se->op.fsync)
-		req->se->op.fsync(req, nodeid, arg->fsync_flags & 1, &fi);
+		req->se->op.fsync(req, nodeid, datasync, &fi);
 	else
 		fuse_reply_err(req, ENOSYS);
 }
@@ -1491,12 +1494,13 @@ static void do_fsyncdir(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 {
 	struct fuse_fsync_in *arg = (struct fuse_fsync_in *) inarg;
 	struct fuse_file_info fi;
+	int datasync = arg->fsync_flags & 1;
 
 	memset(&fi, 0, sizeof(fi));
 	fi.fh = arg->fh;
 
 	if (req->se->op.fsyncdir)
-		req->se->op.fsyncdir(req, nodeid, arg->fsync_flags & 1, &fi);
+		req->se->op.fsyncdir(req, nodeid, datasync, &fi);
 	else
 		fuse_reply_err(req, ENOSYS);
 }
@@ -1810,6 +1814,27 @@ static void do_fallocate(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 		fuse_reply_err(req, ENOSYS);
 }
 
+static void do_copy_file_range(fuse_req_t req, fuse_ino_t nodeid_in, const void *inarg)
+{
+	struct fuse_copy_file_range_in *arg = (struct fuse_copy_file_range_in *) inarg;
+	struct fuse_file_info fi_in, fi_out;
+
+	memset(&fi_in, 0, sizeof(fi_in));
+	fi_in.fh = arg->fh_in;
+
+	memset(&fi_out, 0, sizeof(fi_out));
+	fi_out.fh = arg->fh_out;
+
+
+	if (req->se->op.copy_file_range)
+		req->se->op.copy_file_range(req, nodeid_in, arg->off_in,
+					    &fi_in, arg->nodeid_out,
+					    arg->off_out, &fi_out, arg->len,
+					    arg->flags);
+	else
+		fuse_reply_err(req, ENOSYS);
+}
+
 static void do_init(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 {
 	struct fuse_init_in *arg = (struct fuse_init_in *) inarg;
@@ -1882,6 +1907,8 @@ static void do_init(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 			se->conn.capable |= FUSE_CAP_POSIX_ACL;
 		if (arg->flags & FUSE_HANDLE_KILLPRIV)
 			se->conn.capable |= FUSE_CAP_HANDLE_KILLPRIV;
+		if (arg->flags & FUSE_NO_OPENDIR_SUPPORT)
+			se->conn.capable |= FUSE_CAP_NO_OPENDIR_SUPPORT;
 	} else {
 		se->conn.max_readahead = 0;
 	}
@@ -2395,6 +2422,7 @@ static struct {
 	[FUSE_BATCH_FORGET] = { do_batch_forget, "BATCH_FORGET" },
 	[FUSE_READDIRPLUS] = { do_readdirplus,	"READDIRPLUS"},
 	[FUSE_RENAME2]     = { do_rename2,      "RENAME2"    },
+	[FUSE_COPY_FILE_RANGE] = { do_copy_file_range, "COPY_FILE_RANGE" },
 	[CUSE_INIT]	   = { cuse_lowlevel_init, "CUSE_INIT"   },
 };
 

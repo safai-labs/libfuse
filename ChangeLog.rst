@@ -1,5 +1,51 @@
 Unreleased Changes
-=================
+==================
+
+* Added a new example (passthrough_hp). The functionality is similar
+  to passthrough_ll, but the implementation focuses on performance and
+  correctness rather than simplicity.
+
+libfuse 3.5.0 (2019-04-16)
+==========================
+
+* Changed ioctl commands to "unsigned int" in order to support commands
+  which do not fit into a signed int. Commands issued by applications
+  are still truncated to 32 bits.
+* Added SMB2 to whitelist (so users can now mount FUSE filesystems
+  on mountpoints within SMB 2.0 filesystems).
+* Added a new `cache_readdir` flag to `fuse_file_info` to enable
+  caching of readdir results. Supported by kernels 4.20 and newer.
+* Add support and documentation for FUSE_CAP_NO_OPENDIR_SUPPORT.
+
+libfuse 3.4.2 (2019-03-09)
+==========================
+
+* Fixed a memory leak in `examples/passthrough_ll.c`.
+* Added OpenAFS to whitelist (so users can now mount FUSE filesystems
+  on mountpoints within OpenAFS filesystems).
+* Added HFS+ to whitelist (so users can now mount FUSE filesystems
+  on mountpoints within HFS+ filesystems).
+* Documentation improvements.
+
+libfuse 3.4.1 (2018-12-22)
+==========================
+
+* The `examples/passthrough_ll.c` example filesystem has been
+  significantly extended.
+* Support for `copy_file_range` has been added.
+* Build system updates for non-Linux systems.
+
+libfuse 3.4.0
+=============
+
+* Add `copy_file_range()` to support efficient copying of data from one file to
+  an other.
+
+libfuse 3.3.0 (2018-11-06)
+==========================
+
+* The `auto_unmount` mode now works correctly in combination with
+  autofs.
 
 * The FUSE_CAP_READDIRPLUS_AUTO capability is no longer enabled by
   default unless the file system defines both a readdir() and a
@@ -16,6 +62,9 @@ Unreleased Changes
   `/dev/fuse` and mount the file system itself, then run the FUSE file
   filesystem fully unprivileged and unable to re-acquire privilege via setuid,
   fscaps, etc.
+
+* Documented under which conditions the `fuse_lowlevel_notify_*`
+  functions may block.
 
 libfuse 3.2.6 (2018-08-31)
 ==========================

@@ -20,16 +20,18 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <paths.h>
-#ifndef __NetBSD__
+#if !defined( __NetBSD__) && !defined(__FreeBSD__) && !defined(__DragonFly__)
 #include <mntent.h>
+#else
+#define IGNORE_MTAB
 #endif
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/mount.h>
 #include <sys/param.h>
 
-#ifdef __NetBSD__
-#define umount2(mnt, flags) unmount(mnt, (flags == 2) ? MNT_FORCE : 0)
+#if defined(__NetBSD__) || defined(__FreeBSD__) || defined(__DragonFly__)
+#define umount2(mnt, flags) unmount(mnt, ((flags) == 2) ? MNT_FORCE : 0)
 #endif
 
 #ifdef IGNORE_MTAB

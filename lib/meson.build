@@ -1,19 +1,23 @@
 libfuse_sources = ['fuse.c', 'fuse_i.h', 'fuse_loop.c', 'fuse_loop_mt.c',
                    'fuse_lowlevel.c', 'fuse_misc.h', 'fuse_opt.c',
                    'fuse_signals.c', 'buffer.c', 'cuse_lowlevel.c',
-	           'helper.c', 'modules/subdir.c' ]
+                   'helper.c', 'modules/subdir.c', 'mount_util.c' ]
 
 if host_machine.system().startswith('linux')
-   libfuse_sources += [ 'mount.c', 'mount_util.c' ]
+   libfuse_sources += [ 'mount.c' ]
 else
    libfuse_sources += [ 'mount_bsd.c' ]
 endif
 
+deps = [ thread_dep ]
 if cfg.get('HAVE_ICONV')
    libfuse_sources += [ 'modules/iconv.c' ]
+   libiconv = cc.find_library('iconv', required: false)
+   if libiconv.found()
+      deps += [ libiconv ]
+   endif
 endif
 
-deps = [ thread_dep ]
 libdl = cc.find_library('dl', required: false)
 if libdl.found()
    deps += [ libdl ]
@@ -32,7 +36,7 @@ libfuse = library('fuse3', libfuse_sources, version: meson.project_version(),
                   soversion: '3', include_directories: include_dirs,
                   dependencies: deps, install: true,
                   link_depends: 'fuse_versionscript',
-                  c_args: [ '-DFUSE_USE_VERSION=33',
+                  c_args: [ '-DFUSE_USE_VERSION=34',
                             '-DFUSERMOUNT_DIR="@0@"'.format(fusermount_path) ],
                   link_args: ['-Wl,--version-script,' + meson.current_source_dir()
                               + '/fuse_versionscript' ])

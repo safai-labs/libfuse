@@ -37,6 +37,8 @@
 #define _GNU_SOURCE
 #define FUSE_USE_VERSION 31
 
+#include "config.h"
+
 #include <fuse_lowlevel.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -53,6 +55,8 @@
 #include <pthread.h>
 #include <sys/file.h>
 #include <sys/xattr.h>
+
+#include "passthrough_helpers.h"
 
 /* We are re-using pointers to our `struct lo_inode` and `struct
    lo_dirp` elements as inodes. This means that we must be able to
@@ -379,24 +383,15 @@ static void lo_mknod_symlink(fuse_req_t req, fuse_ino_t parent,
 			     const char *name, mode_t mode, dev_t rdev,
 			     const char *link)
 {
-	int newfd = -1;
 	int res;
 	int saverr;
-	struct lo_inode *inode;
 	struct lo_inode *dir = lo_inode(req, parent);
 	struct fuse_entry_param e;
 
 	saverr = ENOMEM;
-	inode = calloc(1, sizeof(struct lo_inode));
-	if (!inode)
-		goto out;
 
-	if (S_ISDIR(mode))
-		res = mkdirat(dir->fd, name, mode);
-	else if (S_ISLNK(mode))
-		res = symlinkat(link, dir->fd, name);
-	else
-		res = mknodat(dir->fd, name, mode, rdev);
+	res = mknod_wrapper(dir->fd, name, link, mode, rdev);
+
 	saverr = errno;
 	if (res == -1)
 		goto out;
@@ -413,9 +408,6 @@ static void lo_mknod_symlink(fuse_req_t req, fuse_ino_t parent,
 	return;
 
 out:
-	if (newfd != -1)
-		close(newfd);
-	free(inode);
 	fuse_reply_err(req, saverr);
 }
 
@@ -664,22 +656,23 @@ static void lo_do_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
 	struct lo_dirp *d = lo_dirp(fi);
 	char *buf;
 	char *p;
-	size_t rem;
+	size_t rem = size;
 	int err;
 
 	(void) ino;
 
 	buf = calloc(1, size);
-	if (!buf)
-		return (void) fuse_reply_err(req, ENOMEM);
+	if (!buf) {
+		err = ENOMEM;
+		goto error;
+	}
+	p = buf;
 
 	if (offset != d->offset) {
 		seekdir(d->dp, offset);
 		d->entry = NULL;
 		d->offset = offset;
 	}
-	p = buf;
-	rem = size;
 	while (1) {
 		size_t entsize;
 		off_t nextoff;
@@ -689,18 +682,19 @@ static void lo_do_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
 			errno = 0;
 			d->entry = readdir(d->dp);
 			if (!d->entry) {
-				if (errno && rem == size) {
+				if (errno) {  // Error
 					err = errno;
 					goto error;
+				} else {  // End of stream
+					break; 
 				}
-				break;
 			}
 		}
-		nextoff = telldir(d->dp);
+		nextoff = d->entry->d_off;
 		name = d->entry->d_name;
+		fuse_ino_t entry_ino = 0;
 		if (plus) {
 			struct fuse_entry_param e;
-
 			if (is_dot_or_dotdot(name)) {
 				e = (struct fuse_entry_param) {
 					.attr.st_ino = d->entry->d_ino,
@@ -710,6 +704,7 @@ static void lo_do_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
 				err = lo_do_lookup(req, ino, name, &e);
 				if (err)
 					goto error;
+				entry_ino = e.ino;
 			}
 
 			entsize = fuse_add_direntry_plus(req, p, rem, name,
@@ -722,9 +717,12 @@ static void lo_do_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
 			entsize = fuse_add_direntry(req, p, rem, name,
 						    &st, nextoff);
 		}
-		if (entsize > rem)
+		if (entsize > rem) {
+			if (entry_ino != 0) 
+				lo_forget_one(req, entry_ino, 1);
 			break;
-
+		}
+		
 		p += entsize;
 		rem -= entsize;
 
@@ -732,13 +730,17 @@ static void lo_do_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
 		d->offset = nextoff;
 	}
 
-	fuse_reply_buf(req, buf, size - rem);
-	free(buf);
-	return;
-
+    err = 0;
 error:
-	free(buf);
-	fuse_reply_err(req, err);
+    // If there's an error, we can only signal it if we haven't stored
+    // any entries yet - otherwise we'd end up with wrong lookup
+    // counts for the entries that are already in the buffer. So we
+    // return what we've collected until that point.
+    if (err && rem == size)
+	    fuse_reply_err(req, err);
+    else
+	    fuse_reply_buf(req, buf, size - rem);
+    free(buf);
 }
 
 static void lo_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
@@ -766,6 +768,7 @@ static void lo_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 		      mode_t mode, struct fuse_file_info *fi)
 {
 	int fd;
+	struct lo_data *lo = lo_data(req);
 	struct fuse_entry_param e;
 	int err;
 
@@ -779,6 +782,10 @@ static void lo_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 		return (void) fuse_reply_err(req, errno);
 
 	fi->fh = fd;
+	if (lo->cache == CACHE_NEVER)
+		fi->direct_io = 1;
+	else if (lo->cache == CACHE_ALWAYS)
+		fi->keep_cache = 1;
 
 	err = lo_do_lookup(req, parent, name, &e);
 	if (err)
@@ -924,12 +931,19 @@ static void lo_fallocate(fuse_req_t req, fuse_ino_t ino, int mode,
 	int err;
 	(void) ino;
 
+#ifdef HAVE_FALLOCATE
+	err = fallocate(fi->fh, mode, offset, length);
+	if (err < 0)
+		err = errno;
+
+#elif HAVE_POSIX_FALLOCATE
 	if (mode) {
 		fuse_reply_err(req, EOPNOTSUPP);
 		return;
 	}
 
 	err = posix_fallocate(fi->fh, offset, length);
+#endif
 
 	fuse_reply_err(req, err);
 }
@@ -1121,6 +1135,31 @@ out:
 	fuse_reply_err(req, saverr);
 }
 
+#ifdef HAVE_COPY_FILE_RANGE
+static void lo_copy_file_range(fuse_req_t req, fuse_ino_t ino_in, off_t off_in,
+			       struct fuse_file_info *fi_in,
+			       fuse_ino_t ino_out, off_t off_out,
+			       struct fuse_file_info *fi_out, size_t len,
+			       int flags)
+{
+	ssize_t res;
+
+	if (lo_debug(req))
+		fprintf(stderr, "lo_copy_file_range(ino=%" PRIu64 "/fd=%lu, "
+				"off=%lu, ino=%" PRIu64 "/fd=%lu, "
+				"off=%lu, size=%zd, flags=0x%x)\n",
+			ino_in, fi_in->fh, off_in, ino_out, fi_out->fh, off_out,
+			len, flags);
+
+	res = copy_file_range(fi_in->fh, &off_in, fi_out->fh, &off_out, len,
+			      flags);
+	if (res < 0)
+		fuse_reply_err(req, -errno);
+	else
+		fuse_reply_write(req, res);
+}
+#endif
+
 static struct fuse_lowlevel_ops lo_oper = {
 	.init		= lo_init,
 	.lookup		= lo_lookup,
@@ -1155,6 +1194,9 @@ static struct fuse_lowlevel_ops lo_oper = {
 	.listxattr	= lo_listxattr,
 	.setxattr	= lo_setxattr,
 	.removexattr	= lo_removexattr,
+#ifdef HAVE_COPY_FILE_RANGE
+	.copy_file_range = lo_copy_file_range,
+#endif
 };
 
 int main(int argc, char *argv[])
@@ -1186,6 +1228,13 @@ int main(int argc, char *argv[])
 		printf("FUSE library version %s\n", fuse_pkgversion());
 		fuse_lowlevel_version();
 		ret = 0;
+		goto err_out1;
+	}
+
+	if(opts.mountpoint == NULL) {
+		printf("usage: %s [options] <mountpoint>\n", argv[0]);
+		printf("       %s --help\n", argv[0]);
+		ret = 1;
 		goto err_out1;
 	}
 
