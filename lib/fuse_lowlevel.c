@@ -285,7 +285,7 @@ size_t fuse_add_direntry(fuse_req_t req, char *buf, size_t bufsize,
 	dirent->off = off;
 	dirent->namelen = namelen;
 	dirent->type = (stbuf->st_mode & S_IFMT) >> 12;
-	strncpy(dirent->name, name, namelen);
+	memcpy(dirent->name, name, namelen);
 	memset(dirent->name + namelen, 0, entlen_padded - entlen);
 
 	return entlen_padded;
@@ -378,7 +378,7 @@ size_t fuse_add_direntry_plus(fuse_req_t req, char *buf, size_t bufsize,
 	dirent->off = off;
 	dirent->namelen = namelen;
 	dirent->type = (e->attr.st_mode & S_IFMT) >> 12;
-	strncpy(dirent->name, name, namelen);
+	memcpy(dirent->name, name, namelen);
 	memset(dirent->name + namelen, 0, entlen_padded - entlen);
 
 	return entlen_padded;
@@ -611,6 +611,35 @@ static int read_back(int fd, char *buf, size_t len)
 	return 0;
 }
 
+static int grow_pipe_to_max(int pipefd)
+{
+	int max;
+	int res;
+	int maxfd;
+	char buf[32];
+
+	maxfd = open("/proc/sys/fs/pipe-max-size", O_RDONLY);
+	if (maxfd < 0)
+		return -errno;
+
+	res = read(maxfd, buf, sizeof(buf) - 1);
+	if (res < 0) {
+		int saved_errno;
+
+		saved_errno = errno;
+		close(maxfd);
+		return -saved_errno;
+	}
+	close(maxfd);
+	buf[res] = '\0';
+
+	max = atoi(buf);
+	res = fcntl(pipefd, F_SETPIPE_SZ, max);
+	if (res < 0)
+		return -errno;
+	return max;
+}
+
 static int fuse_send_data_iov(struct fuse_session *se, struct fuse_chan *ch,
 			       struct iovec *iov, int iov_count,
 			       struct fuse_bufvec *buf, unsigned int flags)
@@ -666,6 +695,9 @@ static int fuse_send_data_iov(struct fuse_session *se, struct fuse_chan *ch,
 		if (llp->can_grow) {
 			res = fcntl(llp->pipe[0], F_SETPIPE_SZ, pipesize);
 			if (res == -1) {
+				res = grow_pipe_to_max(llp->pipe[0]);
+				if (res > 0)
+					llp->size = res;
 				llp->can_grow = 0;
 				goto fallback;
 			}
@@ -1909,6 +1941,14 @@ static void do_init(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 			se->conn.capable |= FUSE_CAP_HANDLE_KILLPRIV;
 		if (arg->flags & FUSE_NO_OPENDIR_SUPPORT)
 			se->conn.capable |= FUSE_CAP_NO_OPENDIR_SUPPORT;
+		if (!(arg->flags & FUSE_MAX_PAGES)) {
+			size_t max_bufsize =
+				FUSE_DEFAULT_MAX_PAGES_PER_REQ * getpagesize()
+				+ FUSE_BUFFER_HEADER_SIZE;
+			if (bufsize > max_bufsize) {
+				bufsize = max_bufsize;
+			}
+		}
 	} else {
 		se->conn.max_readahead = 0;
 	}
@@ -1955,10 +1995,10 @@ static void do_init(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 			bufsize);
 		bufsize = FUSE_MIN_READ_BUFFER;
 	}
+	se->bufsize = bufsize;
 
-	bufsize -= 4096;
-	if (bufsize < se->conn.max_write)
-		se->conn.max_write = bufsize;
+	if (se->conn.max_write > bufsize - FUSE_BUFFER_HEADER_SIZE)
+		se->conn.max_write = bufsize - FUSE_BUFFER_HEADER_SIZE;
 
 	se->got_init = 1;
 	if (se->op.init)
@@ -1983,6 +2023,14 @@ static void do_init(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 		se->error = -EPROTO;
 		fuse_session_exit(se);
 		return;
+	}
+
+	if (se->conn.max_write < bufsize - FUSE_BUFFER_HEADER_SIZE) {
+		se->bufsize = se->conn.max_write + FUSE_BUFFER_HEADER_SIZE;
+	}
+	if (arg->flags & FUSE_MAX_PAGES) {
+		outarg.flags |= FUSE_MAX_PAGES;
+		outarg.max_pages = (se->conn.max_write - 1) / getpagesize() + 1;
 	}
 
 	/* Always enable big writes, this is superseded
@@ -2566,7 +2614,7 @@ void fuse_session_process_buf_int(struct fuse_session *se,
 		mbuf = newmbuf;
 
 		tmpbuf = FUSE_BUFVEC_INIT(buf->size - write_header_size);
-		tmpbuf.buf[0].mem = mbuf + write_header_size;
+		tmpbuf.buf[0].mem = (char *)mbuf + write_header_size;
 
 		res = fuse_ll_copy_from_pipe(&tmpbuf, &bufv);
 		err = -res;
@@ -2678,6 +2726,9 @@ int fuse_session_receive_buf_int(struct fuse_session *se, struct fuse_buf *buf,
 			res = fcntl(llp->pipe[0], F_SETPIPE_SZ, bufsize);
 			if (res == -1) {
 				llp->can_grow = 0;
+				res = grow_pipe_to_max(llp->pipe[0]);
+				if (res > 0)
+					llp->size = res;
 				goto fallback;
 			}
 			llp->size = res;
@@ -2807,11 +2858,6 @@ restart:
 	return res;
 }
 
-#define KERNEL_BUF_PAGES 32
-
-/* room needed in buffer to accommodate header */
-#define HEADER_SIZE 0x1000
-
 struct fuse_session *fuse_session_new(struct fuse_args *args,
 				      const struct fuse_lowlevel_ops *op,
 				      size_t op_size, void *userdata)
@@ -2872,7 +2918,8 @@ struct fuse_session *fuse_session_new(struct fuse_args *args,
 	if (se->debug)
 		fprintf(stderr, "FUSE library version: %s\n", PACKAGE_VERSION);
 
-	se->bufsize = KERNEL_BUF_PAGES * getpagesize() + HEADER_SIZE;
+	se->bufsize = FUSE_MAX_MAX_PAGES * getpagesize() +
+		FUSE_BUFFER_HEADER_SIZE;
 
 	list_init_req(&se->list);
 	list_init_req(&se->interrupts);
