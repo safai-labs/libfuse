@@ -1,3 +1,6 @@
+option('enable-static-lib', type: 'boolean', value: false,
+       description: 'Enable static building a static library')
+
 option('disable-mtab', type : 'boolean', value : false,
        description: 'Disable and ignore usage of /etc/mtab')
 

@@ -5,6 +5,9 @@ Unreleased Changes
   to passthrough_ll, but the implementation focuses on performance and
   correctness rather than simplicity.
 
+* Added static building of the library. Use -Denable-static-lib=true
+  when running meson.
+
 libfuse 3.5.0 (2019-04-16)
 ==========================
 

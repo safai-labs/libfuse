@@ -40,9 +40,23 @@ libfuse = library('fuse3', libfuse_sources, version: meson.project_version(),
                             '-DFUSERMOUNT_DIR="@0@"'.format(fusermount_path) ],
                   link_args: ['-Wl,--version-script,' + meson.current_source_dir()
                               + '/fuse_versionscript' ])
+generated_libs = [ libfuse ]
+if get_option('enable-static-lib')
+   libfuse_static = static_library('fuse3', libfuse_sources, 
+                  include_directories: include_dirs,
+                  dependencies: deps, install: true,
+                  link_depends: 'fuse_versionscript',
+                  c_args: [ '-DFUSE_USE_VERSION=34',
+                  '-DFUSERMOUNT_DIR="@0@"'.format(fusermount_path)],
+                  link_args: ['-Wl,--version-script,' + meson.current_source_dir()
+                              + '/fuse_versionscript'])
+   generated_libs += libfuse_static
+endif 
+
+ generated_libs += '-lpthread'
 
 pkg = import('pkgconfig')
-pkg.generate(libraries: [ libfuse, '-lpthread' ],
+pkg.generate(libraries: generated_libs,
              libraries_private: '-ldl',
              version: meson.project_version(),
              name: 'fuse3',
